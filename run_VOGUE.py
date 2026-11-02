@@ -27,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Directory that contains the utils/ package.")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Torch device, e.g. cuda, cuda:0 or cpu.")
-    parser.add_argument("--detect-stride", type=int, default=2,
+    parser.add_argument("--detect-stride", type=int, default=1,
                         help="Run segmentation/face detection every N frames; boxes are interpolated between samples.")
     parser.add_argument("--first-push-ratio", type=float, default=1.0 / 3.0,
                         help="Fraction of the source duration used for the first cam2 push-in.")
