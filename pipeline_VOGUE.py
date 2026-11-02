@@ -299,10 +299,11 @@ def _call_model(model: Any, method_names: Sequence[str], frame_bgr: np.ndarray,
         method = getattr(model, method_name, None)
         if not callable(method):
             continue
-        for image in image_candidates:
+        for image_index, image in enumerate(image_candidates):
             if image is None:
                 continue
-            signature_key = (method_name, type(image).__name__)
+            # RGB and BGR frames share the same Python type; keep them as distinct attempts.
+            signature_key = (method_name, image_index)
             if signature_key in attempted:
                 continue
             attempted.add(signature_key)
