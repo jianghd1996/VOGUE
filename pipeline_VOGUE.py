@@ -332,7 +332,7 @@ class VOGUEPipeline:
         model_dir: Optional[str] = None,
         utils_root: Optional[str] = None,
         device: str = "cuda",
-        detect_stride: int = 2,
+        detect_stride: int = 1,
         first_push_ratio: float = 1.0 / 3.0,
         cut_hold_seconds: float = 0.55,
         subject_fill: float = 0.86,
