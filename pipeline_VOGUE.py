@@ -189,9 +189,101 @@ def _extract_box_candidates(value: Any, width: int, height: int,
     return found
 
 
+
+def _extract_face_candidates(value: Any, width: int, height: int,
+                             depth: int = 0) -> List[Dict[str, Any]]:
+    """Parse FaceDetector.predict() output: [x1,y1,x2,y2,score,lm5(10)]."""
+    if value is None or depth > 5:
+        return []
+    if isinstance(value, dict):
+        for key in ("boxes_conf_landms", "face_detections", "detections", "faces", "dets", "results"):
+            if key in value:
+                parsed = _extract_face_candidates(value[key], width, height, depth + 1)
+                if parsed:
+                    return parsed
+        result: List[Dict[str, Any]] = []
+        for item in value.values():
+            result.extend(_extract_face_candidates(item, width, height, depth + 1))
+        return result
+    if isinstance(value, (tuple, list)):
+        try:
+            arr = np.asarray(value, dtype=np.float32)
+        except (TypeError, ValueError):
+            arr = None
+        if arr is not None and arr.ndim == 2 and arr.shape[1] >= 5:
+            return _extract_face_candidates(arr, width, height, depth + 1)
+        if arr is not None and arr.ndim == 1 and arr.size >= 5:
+            return _extract_face_candidates(arr.reshape(1, -1), width, height, depth + 1)
+        result: List[Dict[str, Any]] = []
+        for item in value:
+            result.extend(_extract_face_candidates(item, width, height, depth + 1))
+        return result
+
+    arr = _to_numpy(value)
+    if arr is None:
+        return []
+    arr = np.asarray(arr)
+    arr = np.squeeze(arr)
+    if arr.ndim == 1 and arr.size >= 5:
+        arr = arr.reshape(1, -1)
+    if arr.ndim != 2 or arr.shape[1] < 5:
+        return []
+
+    result = []
+    for row in arr:
+        box = _as_float_box(row[:4], width, height)
+        if box is None:
+            continue
+        confidence = float(row[4])
+        landmarks = None
+        if row.size >= 15:
+            points = np.asarray(row[5:15], dtype=np.float32).reshape(5, 2)
+            if np.nanmax(np.abs(points)) <= 1.5:
+                points[:, 0] *= width
+                points[:, 1] *= height
+            points[:, 0] = np.clip(points[:, 0], 0, width - 1)
+            points[:, 1] = np.clip(points[:, 1], 0, height - 1)
+            landmarks = points.tolist()
+        result.append({
+            "bbox": box,
+            "confidence": confidence,
+            "landmarks": landmarks,
+        })
+    return result
+
+
+def _box_iou(a: Sequence[float], b: Sequence[float]) -> float:
+    ax1, ay1, ax2, ay2 = [float(v) for v in a]
+    bx1, by1, bx2, by2 = [float(v) for v in b]
+    iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0.0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    area_a = max(1.0, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1.0, (bx2 - bx1) * (by2 - by1))
+    return inter / max(1e-6, area_a + area_b - inter)
+
+
+def _interpolate_landmarks(samples: Sequence[Optional[Sequence[Sequence[float]]]]) -> List[Optional[List[List[float]]]]:
+    valid = [i for i, points in enumerate(samples) if points is not None]
+    if not valid:
+        return [None for _ in samples]
+    values = np.asarray([samples[i] for i in valid], dtype=np.float32)  # [N, 5, 2]
+    x = np.arange(len(samples), dtype=np.float32)
+    result: List[Optional[List[List[float]]]] = []
+    for i in range(len(samples)):
+        points = np.empty((5, 2), dtype=np.float32)
+        for landmark_idx in range(5):
+            for coord_idx in range(2):
+                points[landmark_idx, coord_idx] = np.interp(
+                    x[i], valid, values[:, landmark_idx, coord_idx]
+                )
+        result.append(points.tolist())
+    return result
+
+
 def _call_model(model: Any, method_names: Sequence[str], frame_bgr: np.ndarray,
-                label: str) -> Any:
-    """Call the first compatible public inference method on a local wrapper."""
+                label: str, prefer_rgb: bool = False) -> Any:
+    """Call a wrapper using the image convention expected by the local pipeline."""
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     pil_image = None
     try:
@@ -202,11 +294,12 @@ def _call_model(model: Any, method_names: Sequence[str], frame_bgr: np.ndarray,
 
     errors: List[str] = []
     attempted = set()
+    image_candidates = (rgb, frame_bgr, pil_image) if prefer_rgb else (frame_bgr, rgb, pil_image)
     for method_name in method_names:
         method = getattr(model, method_name, None)
         if not callable(method):
             continue
-        for image in (frame_bgr, rgb, pil_image):
+        for image in image_candidates:
             if image is None:
                 continue
             signature_key = (method_name, type(image).__name__)
@@ -410,11 +503,13 @@ class VOGUEPipeline:
         return info
 
     def _segment_frame(self, frame: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[List[float]]]:
+        # Existing project API: mask = seg_module(np.asarray(PIL.Image.open(...)))
+        # OpenCV frames are BGR, so feed RGB exactly as Image.open(...).
         output = _call_model(
             self.seg_module,
-            ("segment", "get_mask", "get_segmentation", "get_saliency",
-             "saliency", "inference", "predict", "process", "run", "forward", "__call__"),
-            frame, "Segmentation"
+            ("__call__", "segment", "get_mask", "get_segmentation", "get_saliency",
+             "saliency", "inference", "predict", "process", "run", "forward"),
+            frame, "Segmentation", prefer_rgb=True
         )
         h, w = frame.shape[:2]
         mask = _extract_mask_candidate(output)
@@ -434,18 +529,105 @@ class VOGUEPipeline:
             return None, direct_boxes[0][0]
         return None, None
 
-    def _detect_faces(self, frame: np.ndarray) -> List[Tuple[List[float], float]]:
+    def _detect_faces(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        # Existing project API: boxes_conf_landms = face_detector.predict(image)
+        # Its rows are [x1,y1,x2,y2,confidence, five (x,y) landmarks].
         output = _call_model(
             self.face_detector,
-            ("detect_image", "detect_faces", "detect_face", "get_faces",
-             "detect", "inference", "predict", "process", "run", "forward", "__call__"),
-            frame, "FaceDetector"
+            ("predict", "detect_image", "detect_faces", "detect_face", "get_faces",
+             "detect", "inference", "process", "run", "forward", "__call__"),
+            frame, "FaceDetector", prefer_rgb=True
         )
         h, w = frame.shape[:2]
-        candidates = _extract_box_candidates(output, w, h)
-        candidates = [(box, score) for box, score in candidates if score >= 0.0]
-        candidates.sort(key=lambda item: (item[0][2] - item[0][0]) * (item[0][3] - item[0][1]), reverse=True)
+        candidates = _extract_face_candidates(output, w, h)
+        candidates.sort(key=lambda item: item["confidence"], reverse=True)
         return candidates
+
+    @staticmethod
+    def _track_primary_face(
+        faces_per_frame: Sequence[Sequence[Dict[str, Any]]],
+        subject_boxes: Sequence[Optional[Sequence[float]]],
+        frame_width: int,
+        frame_height: int,
+        max_gap: int = 8,
+    ) -> List[Optional[Dict[str, Any]]]:
+        """Greedy temporal association for the dominant face, similar in purpose to FaceMatcher."""
+        tracks: List[Dict[str, Any]] = []
+        frame_diag = max(1.0, math.hypot(frame_width, frame_height))
+
+        for frame_idx, detections in enumerate(faces_per_frame):
+            subject = subject_boxes[frame_idx] if frame_idx < len(subject_boxes) else None
+            ranked = []
+            for det_idx, det in enumerate(detections):
+                box = det["bbox"]
+                cx = (box[0] + box[2]) * 0.5
+                cy = (box[1] + box[3]) * 0.5
+                inside_subject = 0.0
+                if subject is not None:
+                    sx1, sy1, sx2, sy2 = subject
+                    inside_subject = float(sx1 <= cx <= sx2 and sy1 <= cy <= sy2)
+                ranked.append((det_idx, det, inside_subject))
+            ranked.sort(key=lambda x: (x[2], x[1]["confidence"]), reverse=True)
+
+            assigned_tracks = set()
+            for det_idx, det, _ in ranked:
+                best_track = None
+                best_similarity = -1.0
+                box = det["bbox"]
+                cx = (box[0] + box[2]) * 0.5
+                cy = (box[1] + box[3]) * 0.5
+                for track_idx, track in enumerate(tracks):
+                    if track_idx in assigned_tracks or frame_idx - track["last_frame"] > max_gap:
+                        continue
+                    prev = track["last_bbox"]
+                    pcx = (prev[0] + prev[2]) * 0.5
+                    pcy = (prev[1] + prev[3]) * 0.5
+                    distance = math.hypot(cx - pcx, cy - pcy) / frame_diag
+                    iou = _box_iou(box, prev)
+                    size_ratio = min(
+                        (box[2] - box[0]) * (box[3] - box[1]),
+                        (prev[2] - prev[0]) * (prev[3] - prev[1])
+                    ) / max(
+                        1.0,
+                        (box[2] - box[0]) * (box[3] - box[1]),
+                        (prev[2] - prev[0]) * (prev[3] - prev[1])
+                    )
+                    similarity = 0.55 * iou + 0.30 * max(0.0, 1.0 - distance / 0.12) + 0.15 * size_ratio
+                    if (iou >= 0.01 or distance <= 0.08) and similarity > best_similarity:
+                        best_similarity = similarity
+                        best_track = track_idx
+
+                if best_track is None:
+                    tracks.append({
+                        "detections": [],
+                        "last_bbox": box,
+                        "last_frame": frame_idx,
+                        "confidence_sum": 0.0,
+                    })
+                    best_track = len(tracks) - 1
+
+                track = tracks[best_track]
+                track["detections"].append((frame_idx, det))
+                track["last_bbox"] = box
+                track["last_frame"] = frame_idx
+                track["confidence_sum"] += float(det["confidence"])
+                assigned_tracks.add(best_track)
+
+        if not tracks:
+            return [None for _ in faces_per_frame]
+
+        # Prefer a persistent, high-confidence identity rather than a one-frame false positive.
+        primary = max(
+            tracks,
+            key=lambda t: (
+                len(t["detections"]),
+                t["confidence_sum"] / max(1, len(t["detections"])),
+            )
+        )
+        selected: List[Optional[Dict[str, Any]]] = [None for _ in faces_per_frame]
+        for frame_idx, det in primary["detections"]:
+            selected[frame_idx] = det
+        return selected
 
     def detect_all(self) -> None:
         """Run person segmentation and face detection on each source video."""
@@ -463,7 +645,7 @@ class VOGUEPipeline:
             )
             cap = cv2.VideoCapture(str(path))
             subject_samples: List[Optional[List[float]]] = []
-            face_samples: List[Optional[List[float]]] = []
+            face_candidates_per_sample: List[List[Dict[str, Any]]] = []
             sample_indices: List[int] = []
             camera_mask_dir = mask_root / camera
             camera_mask_dir.mkdir(parents=True, exist_ok=True)
@@ -476,10 +658,11 @@ class VOGUEPipeline:
                 if frame_index % self.detect_stride == 0 or frame_index == info["frame_count"] - 1:
                     mask, subject_box = self._segment_frame(frame)
                     faces = self._detect_faces(frame)
-                    face_box = faces[0][0] if faces else None
                     sample_indices.append(frame_index)
                     subject_samples.append(subject_box)
-                    face_samples.append(face_box)
+                    face_candidates_per_sample.append(faces)
+                    primary_face = max(faces, key=lambda x: x["confidence"]) if faces else None
+                    face_box = primary_face["bbox"] if primary_face else None
                     if mask is not None:
                         cv2.imwrite(str(camera_mask_dir / f"frame_{frame_index:06d}.png"), mask * 255)
                     if frame_index == 0 or frame_index == info["frame_count"] // 2:
@@ -490,6 +673,9 @@ class VOGUEPipeline:
                         if face_box:
                             x1, y1, x2, y2 = [int(round(v)) for v in face_box]
                             cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                            if primary_face and primary_face.get("landmarks"):
+                                for px, py in primary_face["landmarks"]:
+                                    cv2.circle(preview, (int(round(px)), int(round(py))), 3, (255, 0, 255), -1)
                         cv2.imwrite(str(detection_root / f"{camera}_preview_{frame_index:06d}.jpg"), preview)
                     if len(sample_indices) % 50 == 0:
                         LOGGER.info("[%s] detected %d sampled frames...", camera, len(sample_indices))
@@ -498,30 +684,44 @@ class VOGUEPipeline:
 
             if not sample_indices:
                 raise RuntimeError(f"No frames were decoded from {path}")
-            all_subject: List[Optional[List[float]]] = [None] * info["frame_count"]
-            all_face: List[Optional[List[float]]] = [None] * info["frame_count"]
-            for frame_idx, box in zip(sample_indices, _interpolate_boxes(subject_samples)):
-                all_subject[frame_idx] = box
-            for frame_idx, box in zip(sample_indices, _interpolate_boxes(face_samples)):
-                all_face[frame_idx] = box
 
-            # Interpolate across all source frames, then smooth to avoid crop jitter.
-            sparse_subject = [None] * info["frame_count"]
-            sparse_face = [None] * info["frame_count"]
-            for frame_idx, box in zip(sample_indices, subject_samples):
-                sparse_subject[frame_idx] = box
-            for frame_idx, box in zip(sample_indices, face_samples):
-                sparse_face[frame_idx] = box
+            # Associate detections over time (the role played by FaceMatcher in the image pipeline).
+            tracked_faces = self._track_primary_face(
+                face_candidates_per_sample,
+                subject_samples,
+                info["width"],
+                info["height"],
+                max_gap=max(8, self.detect_stride * 5),
+            )
+            face_samples = [item["bbox"] if item else None for item in tracked_faces]
+            landmark_samples = [item.get("landmarks") if item else None for item in tracked_faces]
+            confidence_samples = [float(item["confidence"]) if item else None for item in tracked_faces]
+
+            sparse_subject: List[Optional[List[float]]] = [None] * info["frame_count"]
+            sparse_face: List[Optional[List[float]]] = [None] * info["frame_count"]
+            sparse_landmarks: List[Optional[List[List[float]]]] = [None] * info["frame_count"]
+            sparse_confidence: List[Optional[float]] = [None] * info["frame_count"]
+            for sample_idx, frame_idx in enumerate(sample_indices):
+                sparse_subject[frame_idx] = subject_samples[sample_idx]
+                sparse_face[frame_idx] = face_samples[sample_idx]
+                sparse_landmarks[frame_idx] = landmark_samples[sample_idx]
+                sparse_confidence[frame_idx] = confidence_samples[sample_idx]
+
+            # Interpolate between sampled frames and smooth the crop-driving boxes.
             all_subject = _smooth_boxes(_interpolate_boxes(sparse_subject), radius=2)
             all_face = _smooth_boxes(_interpolate_boxes(sparse_face), radius=2)
+            all_landmarks = _interpolate_landmarks(sparse_landmarks)
 
             if not any(box is not None for box in all_subject):
                 raise RuntimeError(
-                    f"No subject was detected in {camera}. Check the Segmentation wrapper output/API."
+                    f"No subject was detected in {camera}. Check Segmentation.__call__ output; "
+                    "expected a 2D mask with foreground value 255."
                 )
             self.detections[camera] = {
                 "subject_bbox": all_subject,
                 "face_bbox": all_face,
+                "face_landmarks_5pt": all_landmarks,
+                "face_confidence": sparse_confidence,
                 "sampled_frame_indices": sample_indices,
                 "mask_dir": str(camera_mask_dir),
             }
@@ -532,7 +732,10 @@ class VOGUEPipeline:
                 "detect_stride": self.detect_stride,
                 "subject_bbox_xyxy_per_frame": all_subject,
                 "face_bbox_xyxy_per_frame": all_face,
+                "face_landmarks_5pt_per_frame": all_landmarks,
+                "face_confidence_at_sampled_frames": confidence_samples,
                 "sampled_frame_indices": sample_indices,
+                "face_tracking": "greedy temporal association (persistent dominant face)",
                 "mask_dir": str(camera_mask_dir),
             }
             with (detection_root / f"{camera}_detections.json").open("w", encoding="utf-8") as f:
@@ -552,6 +755,14 @@ class VOGUEPipeline:
             return None
         idx = int(np.clip(frame_idx, 0, len(boxes) - 1))
         return boxes[idx]
+
+    @staticmethod
+    def _landmarks_at(camera_data: Dict[str, Any], frame_idx: int) -> Optional[List[List[float]]]:
+        landmarks = camera_data.get("face_landmarks_5pt")
+        if not landmarks:
+            return None
+        idx = int(np.clip(frame_idx, 0, len(landmarks) - 1))
+        return landmarks[idx]
 
     def _upper_body_box(self, person_box: Sequence[float],
                         face_box: Optional[Sequence[float]]) -> List[float]:
