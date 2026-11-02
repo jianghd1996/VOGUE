@@ -147,8 +147,8 @@ def _extract_box_candidates(value: Any, width: int, height: int,
         return []
     found: List[Tuple[List[float], float]] = []
     if isinstance(value, dict):
-        for key in ("boxes", "bboxes", "face_boxes", "faces", "detections",
-                    "bbox", "box", "face", "results"):
+        for key in ("boxes", "bboxes", "face_boxes", "face_bboxes", "face_dets",
+                    "dets", "detections", "bbox", "box", "face", "results"):
             if key in value:
                 found.extend(_extract_box_candidates(value[key], width, height, depth + 1))
         if found:
@@ -157,6 +157,16 @@ def _extract_box_candidates(value: Any, width: int, height: int,
             found.extend(_extract_box_candidates(item, width, height, depth + 1))
         return found
     if isinstance(value, (tuple, list)):
+        # A single box is often returned as a plain Python list [x1, y1, x2, y2, score].
+        try:
+            list_arr = np.asarray(value, dtype=np.float32)
+        except (TypeError, ValueError):
+            list_arr = None
+        if list_arr is not None and list_arr.ndim == 1 and list_arr.size >= 4:
+            box = _as_float_box(list_arr, width, height)
+            if box:
+                score = float(list_arr[4]) if list_arr.size >= 5 else 1.0
+                return [(box, score)]
         for item in value:
             found.extend(_extract_box_candidates(item, width, height, depth + 1))
         return found
