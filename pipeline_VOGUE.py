@@ -12,6 +12,8 @@ The detector wrappers are loaded from:
 from __future__ import annotations
 
 import inspect
+import importlib
+import tempfile
 import json
 import logging
 import math
@@ -487,6 +489,31 @@ class VOGUEPipeline:
         LOGGER.info("Initializing FaceDetector from %s", self.model_dir)
         self.face_detector = FaceDetector(0.8, 50, str(self.model_dir), self.device)
 
+        # The original image pipeline calls read_image(path) before FaceDetector.predict().
+        # Discover it when the utility is exported by the local project; otherwise use RGB frames.
+        self.face_read_image = None
+        self.face_matcher_cls = None
+        for module_name in ("utils.face_detector_retina", "utils.cv_tools", "utils.face_matcher"):
+            try:
+                module = importlib.import_module(module_name)
+            except Exception:
+                continue
+            if self.face_read_image is None and callable(getattr(module, "read_image", None)):
+                self.face_read_image = getattr(module, "read_image")
+            if self.face_matcher_cls is None and callable(getattr(module, "FaceMatcher", None)):
+                self.face_matcher_cls = getattr(module, "FaceMatcher")
+        if self.face_read_image is not None:
+            LOGGER.info("Using project read_image() preprocessing for RetinaFace.")
+        else:
+            LOGGER.warning(
+                "read_image() helper was not exported by the known utils modules; "
+                "FaceDetector.predict() will receive RGB numpy frames."
+            )
+        if self.face_matcher_cls is not None:
+            LOGGER.info("Using the project's FaceMatcher for cross-frame face association.")
+        else:
+            LOGGER.info("FaceMatcher class not found; using built-in temporal face association.")
+
     def _video_metadata(self, path: Path) -> Dict[str, Any]:
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
@@ -531,18 +558,72 @@ class VOGUEPipeline:
         return None, None
 
     def _detect_faces(self, frame: np.ndarray) -> List[Dict[str, Any]]:
-        # Existing project API: boxes_conf_landms = face_detector.predict(image)
-        # Its rows are [x1,y1,x2,y2,confidence, five (x,y) landmarks].
-        output = _call_model(
-            self.face_detector,
-            ("predict", "detect_image", "detect_faces", "detect_face", "get_faces",
-             "detect", "inference", "process", "run", "forward", "__call__"),
-            frame, "FaceDetector", prefer_rgb=True
-        )
+        # Exact project path when available: raw_image, image = read_image(path);
+        # boxes_conf_landms = face_detector.predict(image).
+        output = None
+        if self.face_read_image is not None and callable(getattr(self.face_detector, "predict", None)):
+            fd, temp_path = tempfile.mkstemp(suffix=".jpg", dir=str(self.output_dir))
+            os.close(fd)
+            try:
+                if not cv2.imwrite(temp_path, frame):
+                    raise RuntimeError(f"Failed to stage frame for read_image(): {temp_path}")
+                prepared = self.face_read_image(temp_path)
+                model_input = prepared[1] if isinstance(prepared, (tuple, list)) and len(prepared) >= 2 else prepared
+                output = self.face_detector.predict(model_input)
+            except Exception as exc:
+                LOGGER.warning(
+                    "Project read_image() preprocessing failed (%s); falling back to RGB frame input.",
+                    exc
+                )
+                self.face_read_image = None
+            finally:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+        if output is None:
+            output = _call_model(
+                self.face_detector,
+                ("predict", "detect_image", "detect_faces", "detect_face", "get_faces",
+                 "detect", "inference", "process", "run", "forward", "__call__"),
+                frame, "FaceDetector", prefer_rgb=True
+            )
         h, w = frame.shape[:2]
         candidates = _extract_face_candidates(output, w, h)
         candidates.sort(key=lambda item: item["confidence"], reverse=True)
         return candidates
+
+    def _match_faces_with_project_matcher(
+        self, faces_per_frame: Sequence[Sequence[Dict[str, Any]]]
+    ) -> Optional[List[Optional[Dict[str, Any]]]]:
+        if self.face_matcher_cls is None:
+            return None
+        boxes = [[det["bbox"] for det in frame] for frame in faces_per_frame]
+        confidences = [[det["confidence"] for det in frame] for frame in faces_per_frame]
+        landmarks = [[det["landmarks"] for det in frame] for frame in faces_per_frame]
+        try:
+            matcher = self.face_matcher_cls(min_frames=len(faces_per_frame))
+            matched = matcher.match(boxes, confidences, landmarks)
+            if not matched:
+                return None
+            # The source utility may return several identities; keep the one observed most.
+            _, apps = max(
+                matched.items(),
+                key=lambda item: (
+                    len(item[1]),
+                    sum(float(app[2]) for app in item[1]) / max(1, len(item[1])),
+                )
+            )
+            selected: List[Optional[Dict[str, Any]]] = [None for _ in faces_per_frame]
+            for frame_idx, face_idx, _conf in apps:
+                if 0 <= int(frame_idx) < len(faces_per_frame):
+                    if 0 <= int(face_idx) < len(faces_per_frame[int(frame_idx)]):
+                        selected[int(frame_idx)] = faces_per_frame[int(frame_idx)][int(face_idx)]
+            return selected
+        except Exception as exc:
+            LOGGER.warning("Project FaceMatcher failed (%s); using built-in temporal association.", exc)
+            return None
 
     @staticmethod
     def _track_primary_face(
@@ -687,13 +768,15 @@ class VOGUEPipeline:
                 raise RuntimeError(f"No frames were decoded from {path}")
 
             # Associate detections over time (the role played by FaceMatcher in the image pipeline).
-            tracked_faces = self._track_primary_face(
-                face_candidates_per_sample,
-                subject_samples,
-                info["width"],
-                info["height"],
-                max_gap=max(8, self.detect_stride * 5),
-            )
+            tracked_faces = self._match_faces_with_project_matcher(face_candidates_per_sample)
+            if tracked_faces is None:
+                tracked_faces = self._track_primary_face(
+                    face_candidates_per_sample,
+                    subject_samples,
+                    info["width"],
+                    info["height"],
+                    max_gap=max(8, self.detect_stride * 5),
+                )
             face_samples = [item["bbox"] if item else None for item in tracked_faces]
             landmark_samples = [item.get("landmarks") if item else None for item in tracked_faces]
             confidence_samples = [float(item["confidence"]) if item else None for item in tracked_faces]
